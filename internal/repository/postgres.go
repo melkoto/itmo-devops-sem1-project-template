@@ -46,25 +46,7 @@ func NewPostgresRepo() (*PostgresRepo, error) {
 }
 
 func (repository *PostgresRepo) ImportPrices(csvReader *csv.Reader) (map[string]interface{}, error) {
-	transaction, err := repository.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer transaction.Rollback()
-
-	statement, err := transaction.Prepare(
-		`INSERT INTO prices(id, product_name, category, price, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`)
-	if err != nil {
-		return nil, fmt.Errorf("failed to prepare SQL statement: %w", err)
-	}
-	defer statement.Close()
-
-	statistics := map[string]interface{}{
-		"total_items":      0,
-		"total_categories": make(map[string]struct{}),
-		"total_price":      0.0,
-	}
-
+	var records [][]string
 	for {
 		record, err := csvReader.Read()
 		if err != nil {
@@ -78,7 +60,31 @@ func (repository *PostgresRepo) ImportPrices(csvReader *csv.Reader) (map[string]
 			return nil, fmt.Errorf("invalid record length: %d, expected 5", len(record))
 		}
 
-		id := record[0]
+		records = append(records, record)
+	}
+
+	transaction, err := repository.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer transaction.Rollback()
+
+	// Тесты ожидают, что id будет предоставлено из CSV и вставлено в базу данных.
+	statement, err := transaction.Prepare(`
+		INSERT INTO prices(id, product_name, category, price, created_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (id) DO NOTHING
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to prepare SQL statement: %w", err)
+	}
+	defer statement.Close()
+
+	for _, record := range records {
+		id, err := strconv.Atoi(record[0])
+		if err != nil {
+			return nil, fmt.Errorf("invalid id format in record: %w", err)
+		}
 		productName := record[1]
 		category := record[2]
 		price, err := strconv.ParseFloat(record[3], 64)
@@ -94,10 +100,25 @@ func (repository *PostgresRepo) ImportPrices(csvReader *csv.Reader) (map[string]
 		if err != nil {
 			return nil, fmt.Errorf("error inserting data into database: %w", err)
 		}
+	}
 
-		statistics["total_items"] = statistics["total_items"].(int) + 1
-		statistics["total_categories"].(map[string]struct{})[category] = struct{}{}
-		statistics["total_price"] = statistics["total_price"].(float64) + price
+	var totalItems int
+	var totalPrice float64
+	var totalCategories int
+
+	err = transaction.QueryRow("SELECT COUNT(*) FROM prices").Scan(&totalItems)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count total items: %w", err)
+	}
+
+	err = transaction.QueryRow("SELECT COUNT(DISTINCT category) FROM prices").Scan(&totalCategories)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count total categories: %w", err)
+	}
+
+	err = transaction.QueryRow("SELECT SUM(price) FROM prices").Scan(&totalPrice)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sum total prices: %w", err)
 	}
 
 	if err := transaction.Commit(); err != nil {
@@ -105,9 +126,9 @@ func (repository *PostgresRepo) ImportPrices(csvReader *csv.Reader) (map[string]
 	}
 
 	return map[string]interface{}{
-		"total_items":      statistics["total_items"],
-		"total_categories": len(statistics["total_categories"].(map[string]struct{})),
-		"total_price":      statistics["total_price"],
+		"total_items":      totalItems,
+		"total_categories": totalCategories,
+		"total_price":      totalPrice,
 	}, nil
 }
 
@@ -133,7 +154,7 @@ func (repository *PostgresRepo) ExportPrices() (string, error) {
 
 	for rows.Next() {
 		var (
-			id          string
+			id          int
 			createdAt   time.Time
 			productName string
 			category    string
@@ -145,7 +166,7 @@ func (repository *PostgresRepo) ExportPrices() (string, error) {
 		}
 
 		record := []string{
-			id,
+			strconv.Itoa(id),
 			createdAt.Format("2006-01-02"),
 			productName,
 			category,
@@ -157,7 +178,14 @@ func (repository *PostgresRepo) ExportPrices() (string, error) {
 		}
 	}
 
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error occurred during rows iteration: %w", err)
+	}
+
 	csvWriter.Flush()
+	if err := csvWriter.Error(); err != nil {
+		return "", fmt.Errorf("error flushing CSV writer: %w", err)
+	}
 
 	zipFile, err := os.CreateTemp("", "export-*.zip")
 	if err != nil {
